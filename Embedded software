@@ -1,1 +1,157 @@
+/*
+triple_sensor_demo.c - JSON logger with colour classification
+Channel-0  VL53L0X  distance sensor
+Channel-1  TCS3472  colour sensor A
+Channel-2  TCS3472  colour sensor B
+Every LOOP_DELAY_MS collects one reading, writes a JSON object, and keeps
+only the last 10 seconds by recycling the file.
+*/
+#include <libpynq.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <iic.h>
+#include <switchbox.h>
+#include <time.h>      // clock_gettime
+#include <stdint.h>
+
+#include "TCA9548A.h"
+#include "vl53l0x.h"
+#include "tcs3472.h"
+
+
+#define CH_DIST          2
+#define CH_COLOR_A       0
+#define CH_COLOR_B       1
+
+
+#define VL53_ADDR        0x29
+#define LOOP_DELAY_MS    100
+#define COLOR_INTEG_MS   60
+
+static inline uint64_t time_us_64(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL +
+           (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+
+//colour classifier
+const char *classify_color(uint16_t r, uint16_t g, uint16_t b, uint16_t c)
+{
+    if (c < 100)                                   return "black";
+    if (c > 1000 && r > 300 && g > 300 && b > 300) return "white";
+    if (r > g && r > b)                            return "red";
+    if (g > r && g > b)                            return "green";
+    if (b > r && b > g)                            return "blue";
+    return "unknown";
+}
+
+
+// helper patch to see the colour on the console
+static void patch(uint16_t r, uint16_t g, uint16_t b)
+{
+    printf("\033[48;2;%u;%u;%um  \033[0m",
+           (r>>4)&0xFF, (g>>4)&0xFF, (b>>4)&0xFF);
+}
+
+int main(void)
+{
+    pynq_init();
+    switchbox_set_pin(IO_AR_SCL, SWB_IIC0_SCL);
+    switchbox_set_pin(IO_AR_SDA, SWB_IIC0_SDA);
+    iic_init(IIC0);
+
+    tca9548a mux;
+    if (tca9548a_init(IIC0, &mux)) { perror("mux"); goto shutdown; }
+    vl53x tof;
+    tca9548a_select_channel(&mux, CH_DIST);
+    if (tofPing(IIC0, VL53_ADDR) || tofInit(&tof, IIC0, VL53_ADDR, 0)) {
+        fprintf(stderr, "VL53L0X init failed\n"); goto shutdown;
+    }
+
+    tcs3472 colA = TCS3472_EMPTY, colB = TCS3472_EMPTY;
+    uint8_t id;
+
+    tcs_set_integration(&colA, tcs3472_integration_from_ms(COLOR_INTEG_MS));
+    tcs_set_gain(&colA, x4);
+    tca9548a_select_channel(&mux, CH_COLOR_A);
+    if (tcs_ping(IIC0,&id) || tcs_init(IIC0,&colA)) {
+        fprintf(stderr, "TCS-A init failed\n"); goto shutdown;
+    }
+
+    tcs_set_integration(&colB, tcs3472_integration_from_ms(COLOR_INTEG_MS));
+    tcs_set_gain(&colB, x4);
+    tca9548a_select_channel(&mux, CH_COLOR_B);
+    if (tcs_ping(IIC0,&id) || tcs_init(IIC0,&colB)) {
+        fprintf(stderr, "TCS-B init failed\n"); goto shutdown;
+    }
+
+    sleep_msec(COLOR_INTEG_MS);
+
+//Json log
+    FILE  *logf        = fopen("sensor_log.json","w");
+    bool   first_entry = true;
+    time_t last_rotate = time(NULL);
+    if (!logf) { perror("log"); goto shutdown; }
+    fputs("[\n", logf);
+
+    printf("Logging to sensor_log.json …\n");
+
+    //loop
+    while (1) {
+        //distance
+        tca9548a_select_channel(&mux, CH_DIST);
+        uint32_t dist = tofReadDistance(&tof);
+
+        //colour A
+        tcsReading rgbA;
+        tca9548a_select_channel(&mux, CH_COLOR_A);
+        tcs_get_reading(&colA, &rgbA);
+        const char *nameA = classify_color(rgbA.red,rgbA.green,rgbA.blue,rgbA.clear);
+
+        //colour B
+        tcsReading rgbB;
+        tca9548a_select_channel(&mux, CH_COLOR_B);
+        tcs_get_reading(&colB, &rgbB);
+        const char *nameB = classify_color(rgbB.red,rgbB.green,rgbB.blue,rgbB.clear);
+
+        //display readings in console
+        printf("\033[0K");
+        printf("%u mm | ", dist);
+        patch(rgbA.red,rgbA.green,rgbA.blue); printf(" %-6s | ", nameA);
+        patch(rgbB.red,rgbB.green,rgbB.blue); printf(" %-6s\r", nameB);
+        fflush(stdout);
+    
+        uint64_t t_ms = time_us_64()/1000ULL;
+        if (!first_entry) fputs(",\n", logf);
+        first_entry=false;
+
+        fprintf(logf,
+            "  {\"t_ms\":%llu,\"dist\":\"%u mm\",\"c1\":\"%s\",\"c2\":\"%s\"}",
+            t_ms, dist, nameA, nameB);
+        fflush(logf);
+
+        //10s wipe
+        if (difftime(time(NULL),last_rotate) >= 10.0) {
+            fputs("\n]\n", logf);
+            fclose(logf);
+            logf = fopen("sensor_log.json","w");
+            fputs("[\n", logf);
+            fflush(logf);
+            first_entry = true;
+            last_rotate = time(NULL);
+        }
+        sleep_msec(LOOP_DELAY_MS);
+    }
+
+shutdown:
+    if (logf) { fputs("\n]\n",logf); fclose(logf); }
+    tca9548a_destroy(&mux);
+    iic_destroy(IIC0);
+    pynq_destroy();
+    return EXIT_SUCCESS;
+}
 
