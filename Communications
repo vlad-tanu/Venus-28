@@ -1,0 +1,155 @@
+import matplotlib.pyplot as plt
+import paho.mqtt.client as mqtt
+import threading
+import time
+import queue
+import json
+
+# Enable interactive plotting
+plt.ion()
+fig, ax = plt.subplots(figsize=(8, 8))
+
+# Shared data
+map_data = {
+    'robot_path': [],
+    'boundary': [],
+    'craters': [],
+    'blocks': [],
+    'hills': []
+}
+
+robot_x, robot_y = 0, 0
+data_queue = queue.Queue()
+MAX_PATH_LENGTH = 500  # Optional limit for robot path history
+
+# Marking functions
+def mark_boundary(pos):
+    map_data['boundary'].append((pos['x'], pos['y']))
+
+def mark_crater(crater):
+    map_data['craters'].append(((crater['x'], crater['y']), crater['radius']))
+
+def mark_block(block):
+    map_data['blocks'].append(((block['x'], block['y']), block['height'], block['color']))
+
+def mark_hill(hill):
+    map_data['hills'].append(((hill['x'], hill['y']), hill['height']))
+
+# Visualization
+def plot_map():
+    ax.clear()
+    ax.set_title("Mapped Area")
+    ax.set_aspect('equal')
+    ax.grid(True)
+
+    if map_data['robot_path']:
+        path_x, path_y = zip(*map_data['robot_path'])
+        ax.plot(path_x, path_y, color='blue', linewidth=1, label="Path")
+
+    if map_data['boundary']:
+        bx, by = zip(*map_data['boundary'])
+        ax.scatter(bx, by, c='black', s=20, label="Boundary Points")
+        bx += (bx[0],)
+        by += (by[0],)
+        ax.plot(bx, by, 'k-', linewidth=2)
+
+    labels = set()
+    for (x, y), r in map_data['craters']:
+        circle = plt.Circle((x, y), r, color='red', fill=False, linewidth=1.5)
+        ax.add_patch(circle)
+
+    for (x, y), h, color in map_data['blocks']:
+        label = f"{h}cm block"
+        if label not in labels:
+            ax.scatter(x, y, s=100, c=color, label=label)
+            labels.add(label)
+        else:
+            ax.scatter(x, y, s=100, c=color)
+
+    for (x, y), h in map_data['hills']:
+        if "Hill" not in labels:
+            ax.scatter(x, y, marker='^', s=80, color='brown', label="Hill")
+            labels.add("Hill")
+        else:
+            ax.scatter(x, y, marker='^', s=80, color='brown')
+
+    ax.legend(loc='upper right')
+    plt.draw()
+    plt.pause(0.01)
+
+# MQTT Callbacks
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("✅ Connected to MQTT Broker!")
+        client.subscribe([
+            ("/pynqbridge/62/mapping/positions", 0),
+            ("/pynqbridge/62/mapping/boundaries", 0),
+            ("/pynqbridge/62/mapping/craters", 0),
+            ("/pynqbridge/62/mapping/blocks", 0),
+            ("/pynqbridge/62/mapping/hills", 0)
+        ])
+    else:
+        print(f"❌ Failed to connect, code {rc}")
+
+def on_message(client, userdata, msg):
+    data_queue.put((msg.topic, msg.payload.decode().strip()))
+
+# MQTT Thread
+def mqtt_thread():
+    try:
+        client = mqtt.Client()
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.username_pw_set("robot_62_2", "foyHahum")
+        client.connect("mqtt.ics.ele.tue.nl", 1883, 60)
+        client.loop_forever()
+    except Exception as e:
+        print(f"❌ MQTT Thread Error: {e}")
+
+# Main Loop
+if _name_ == "_main_":
+    threading.Thread(target=mqtt_thread, daemon=True).start()
+    plt.show(block=False)
+
+    try:
+        while True:
+            plot_needed = False
+            while not data_queue.empty():
+                topic, payload = data_queue.get()
+                try:
+                    data = json.loads(payload)
+                except Exception as e:
+                    print(f"Invalid JSON payload on {topic}: {payload}, Error: {e}")
+                    continue
+
+                try:
+                    if topic == "/pynqbridge/62/mapping/positions":
+                        x, y = float(data['x']), float(data['y'])
+                        robot_x, robot_y = x, y
+                        map_data['robot_path'].append((x, y))
+                        if len(map_data['robot_path']) > MAX_PATH_LENGTH:
+                            map_data['robot_path'].pop(0)
+
+                    elif topic == "/pynqbridge/62/mapping/boundaries":
+                        mark_boundary(data)
+
+                    elif topic == "/pynqbridge/62/mapping/craters":
+                        mark_crater(data)
+
+                    elif topic == "/pynqbridge/62/mapping/blocks":
+                        mark_block(data)
+
+                    elif topic == "/pynqbridge/62/mapping/hills":
+                        mark_hill(data)
+
+                    plot_needed = True
+                except Exception as e:
+                    print(f"❌ Error processing {topic}: {data}, Error: {e}")
+
+            if plot_needed:
+                plot_map()
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("🛑 Program interrupted by user")
