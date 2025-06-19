@@ -1,0 +1,298 @@
+/*This makes a JSON file so you can read from it
+ * triple_sensor_demo.c  
+ *
+ * Channel-0  VL53L0X  distance sensor  (cased)
+ * Channel-1  TCS3472  colour sensor A
+ * Channel-2  TCS3472  colour sensor B
+ *
+ * Every LOOP_DELAY_MS collects one reading, writes a JSON object, and keeps
+ * only the last 10 seconds by recycling the file.
+ ******************************************************************************/
+
+#include <libpynq.h>
+#include <uart.h>
+#include <stdio.h>
+#include <stepper.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <iic.h>
+#include <switchbox.h>
+#include <time.h>      // clock_gettime
+#include <stdint.h>    // uint64_t
+
+#include "TCA9548A.h"
+#include "vl53l0x.h"
+#include "tcs3472.h"
+
+/* ---------- channel map ---------- */
+#define CH_DIST          7
+#define CH_COLOR_A       1
+#define CH_COLOR_B       2
+/* ---------------------------------- */
+
+#define VL53_ADDR        0x29
+#define LOOP_DELAY_MS    100
+#define COLOR_INTEG_MS   60
+#define MAX_PAYLOAD_SIZE 1024
+#define MIN_SPEED        3072
+tca9548a mux;
+vl53x tof;
+tcs3472 colA = TCS3472_EMPTY;
+tcs3472 colB = TCS3472_EMPTY;
+
+
+
+static inline uint64_t time_us_64(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);        // always available on Linux
+    return (uint64_t)ts.tv_sec * 1000000ULL +
+           (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/*                ──   simple colour classifier   ──                         */
+const char *classify_color(uint16_t r, uint16_t g, uint16_t b, uint16_t c)
+{
+    if (c < 1000)                                   return "black";
+    if (c > 1500 && r > 900 && g > 900 && b > 900) return "white";
+    if (r > g && r > b)                            return "red";
+    if (g > r && g > b)                            return "green";
+    if (b > r && b > g)                            return "blue";
+    return "unknown";
+}
+/* ------------------------------------------------------------------------- */
+
+/* helper – coloured patch for the console */
+static void patch(uint16_t r, uint16_t g, uint16_t b)
+{
+    printf("\033[48;2;%u;%u;%um  \033[0m",
+           (r>>4)&0xFF, (g>>4)&0xFF, (b>>4)&0xFF);
+}
+
+int extract_int(const char *json, const char *key) {
+    char *key_pos = strstr(json, key);
+    if (!key_pos) return -1;
+    char *colon = strchr(key_pos, ':');
+    if (!colon) return -1;
+
+    int value;
+    if (sscanf(colon + 1, " %d", &value) == 1) {
+        return value;
+    }
+    return -1;
+}
+
+void debug_hex(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X ", buf[i]);
+    }
+    printf("\n");
+}
+
+uint32_t read_uart_length_header() {
+    uint8_t len_buf[4];
+    for (int i = 0; i < 4; ++i) {
+        while (!uart_has_data(UART0)) {
+            struct timespec ts = {0, 100 * 1000};
+            nanosleep(&ts, NULL);
+        }
+        len_buf[i] = uart_recv(UART0);
+    }
+
+    return (len_buf[0] << 24) | (len_buf[1] << 16) | (len_buf[2] << 8) | len_buf[3];
+}
+
+int read_distance_sensor() {
+    tca9548a_select_channel(&mux, CH_DIST);
+    return tofReadDistance(&tof);  // returns in mm
+}
+
+const char* read_color_sensor(int sensor_id) {
+    tcsReading reading;
+
+    if (sensor_id == 1) {
+        tca9548a_select_channel(&mux, CH_COLOR_A);
+        tcs_get_reading(&colA, &reading);
+    } else if (sensor_id == 2) {
+        tca9548a_select_channel(&mux, CH_COLOR_B);
+        tcs_get_reading(&colB, &reading);
+    } else {
+        return "invalid";
+    }
+
+    return classify_color(reading.red, reading.green, reading.blue, reading.clear);
+}
+
+void send_sensor_data() {
+    char message[64];
+
+    int distance = read_distance_sensor();
+    snprintf(message, sizeof(message), "distance_1, %d\n", distance);
+    printf("Sending: %s", message);  // Print before sending
+    for (size_t i = 0; i < strlen(message); ++i) uart_send(UART0, message[i]);
+
+    const char* color1 = read_color_sensor(1);
+    snprintf(message, sizeof(message), "color_1, %s\n", color1);
+    printf("Sending: %s", message);  // Print before sending
+    for (size_t i = 0; i < strlen(message); ++i) uart_send(UART0, message[i]);
+
+    const char* color2 = read_color_sensor(2);
+    snprintf(message, sizeof(message), "color_2, %s\n", color2);
+    printf("Sending: %s", message);  // Print before sending
+    for (size_t i = 0; i < strlen(message); ++i) uart_send(UART0, message[i]);
+}
+
+int main(void)
+{
+    /* === libpynq / I²C / MUX init ================================== */
+    pynq_init();
+    switchbox_init();
+    switchbox_set_pin(IO_AR1, SWB_UART0_TX);
+    switchbox_set_pin(IO_AR0, SWB_UART0_RX);
+    uart_init(UART0);
+    stepper_init();
+    printf("Stepper initialized\n");
+    switchbox_set_pin(IO_AR_SCL, SWB_IIC0_SCL);
+    switchbox_set_pin(IO_AR_SDA, SWB_IIC0_SDA);
+    iic_init(IIC0);
+    send_sensor_data();
+
+    if (tca9548a_init(IIC0, &mux)) { perror("mux"); goto shutdown; }
+
+    /* === VL53L0X =================================================== */
+    tca9548a_select_channel(&mux, CH_DIST);
+    if (tofPing(IIC0, VL53_ADDR) || tofInit(&tof, IIC0, VL53_ADDR, 0)) {
+        fprintf(stderr, "VL53L0X init failed\n"); goto shutdown;
+    }
+
+    uint8_t id;
+
+    tcs_set_integration(&colA, tcs3472_integration_from_ms(COLOR_INTEG_MS));
+    tcs_set_gain(&colA, x4);
+    tca9548a_select_channel(&mux, CH_COLOR_A);
+    if (tcs_ping(IIC0,&id) || tcs_init(IIC0,&colA)) {
+        fprintf(stderr, "TCS-A init failed\n"); goto shutdown;
+    }
+
+    tcs_set_integration(&colB, tcs3472_integration_from_ms(COLOR_INTEG_MS));
+    tcs_set_gain(&colB, x4);
+    tca9548a_select_channel(&mux, CH_COLOR_B);
+    if (tcs_ping(IIC0,&id) || tcs_init(IIC0,&colB)) {
+        fprintf(stderr, "TCS-B init failed\n"); goto shutdown;
+    }
+
+    sleep_msec(COLOR_INTEG_MS);
+
+    /* === main loop ================================================= */
+    while (1) {
+        printf("Waiting for UART data...\n");
+
+        uint32_t length = read_uart_length_header();
+
+        // Validate length
+        uint8_t len_buf[4] = {
+            (length >> 24) & 0xFF,
+            (length >> 16) & 0xFF,
+            (length >> 8) & 0xFF,
+            length & 0xFF
+        };
+
+        while (length == 0 || length > MAX_PAYLOAD_SIZE) {
+            printf("Invalid length %u, resyncing...\n", length);
+            len_buf[0] = len_buf[1];
+            len_buf[1] = len_buf[2];
+            len_buf[2] = len_buf[3];
+
+            while (!uart_has_data(UART0)) {
+                struct timespec ts = {0, 100 * 1000};
+                nanosleep(&ts, NULL);
+            }
+            len_buf[3] = uart_recv(UART0);
+            length = (len_buf[0] << 24) | (len_buf[1] << 16) | (len_buf[2] << 8) | len_buf[3];
+        }
+
+        char payload[MAX_PAYLOAD_SIZE + 1];
+        for (uint32_t i = 0; i < length; ++i) {
+            while (!uart_has_data(UART0)) {
+                struct timespec ts = {0, 100 * 1000};
+                nanosleep(&ts, NULL);
+            }
+            payload[i] = uart_recv(UART0);
+        }
+        payload[length] = '\0';
+
+        printf("Received payload: %s\n", payload);
+
+        int speed = extract_int(payload, "speed");
+        int left = extract_int(payload, "left");
+        int right = extract_int(payload, "right");
+
+        if (speed < MIN_SPEED) speed = MIN_SPEED;
+        if (left == -1 || right == -1) {
+            printf("Invalid JSON.\n");
+            continue;
+        }
+
+        // Run stepper
+        stepper_enable();
+        stepper_set_speed(speed, speed);
+        stepper_steps(left, right);
+        while (!stepper_steps_done()) {
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, NULL);
+        }
+        stepper_disable();
+
+        // After stepper finishes, send sensor data
+        send_sensor_data();
+
+        // Send acknowledgment
+        const char *response = "{\"ack\":true}";
+        uint32_t res_len = strlen(response);
+        uint8_t header[4] = {
+            (res_len >> 24) & 0xFF,
+            (res_len >> 16) & 0xFF,
+            (res_len >> 8) & 0xFF,
+            res_len & 0xFF
+        };
+        for (int i = 0; i < 4; ++i) uart_send(UART0, header[i]);
+        for (uint32_t i = 0; i < res_len; ++i) uart_send(UART0, response[i]);
+
+        printf("Acknowledgment sent.\n");
+        /* distance */
+        tca9548a_select_channel(&mux, CH_DIST);
+        uint32_t dist = tofReadDistance(&tof);
+
+        /* colour A */
+        tcsReading rgbA;
+        tca9548a_select_channel(&mux, CH_COLOR_A);
+        tcs_get_reading(&colA, &rgbA);
+        const char *nameA = classify_color(rgbA.red,rgbA.green,rgbA.blue,rgbA.clear);
+
+        /* colour B */
+        tcsReading rgbB;
+        tca9548a_select_channel(&mux, CH_COLOR_B);
+        tcs_get_reading(&colB, &rgbB);
+        const char *nameB = classify_color(rgbB.red,rgbB.green,rgbB.blue,rgbB.clear);
+
+        /* --- console (optional) ----------------------------------- */
+        printf("\033[0K");                            /* clear line    */
+        printf("%u mm | ", dist);
+        patch(rgbA.red,rgbA.green,rgbA.blue); printf(" %-6s | ", nameA);
+        patch(rgbB.red,rgbB.green,rgbB.blue); printf(" %-6s\r", nameB);
+        fflush(stdout);
+    }
+
+shutdown:
+    stepper_destroy();
+    uart_destroy(UART0);
+    switchbox_destroy();
+    tca9548a_destroy(&mux);
+    iic_destroy(IIC0);
+    pynq_destroy();
+    return EXIT_SUCCESS;
+}
