@@ -1,5 +1,7 @@
 # Venus Challange - Group 28
 
+Use this link https://drive.google.com/drive/folders/1A2m1MlfSksbAkoXHzaLU6IK4rpt4-u_R?usp=sharing to see photos and videos of testing. 
+
 ## Section Definition
 Each section within the project is structured for clarity and collaboration.
 
